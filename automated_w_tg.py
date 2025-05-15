@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import logging
+import threading
 from requests.auth import HTTPBasicAuth
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
@@ -32,6 +33,11 @@ WP_PASSWORD = os.getenv('WP_PASSWORD')
 # Настройка авторизации для WordPress
 auth = HTTPBasicAuth(WP_USERNAME, WP_PASSWORD)
 headers = {"Content-Type": "application/json"}
+
+# Словарь для хранения медиа-групп и их таймеров
+media_groups = {}
+media_group_timers = {}
+stop_event = threading.Event()
 
 # Функция для получения информации о медиа по ID
 def get_media_info(media_id):
@@ -169,12 +175,15 @@ async def status(update: Update, context: CallbackContext):
         await update.message.reply_text("❌ Ошибка подключения к WordPress.")
 
 # Функция для обработки медиа-группы
-async def process_media_group(context: CallbackContext):
-    media_group_id = context.job.data
-    media_group = context.bot_data['media_groups'].get(media_group_id)
+async def process_media_group(bot, media_group_id):
+    global media_groups
     
-    if not media_group:
+    if media_group_id not in media_groups:
+        logger.error(f"Медиа-группа {media_group_id} не найдена")
         return
+    
+    media_group = media_groups[media_group_id]
+    logger.info(f"Обработка медиа-группы {media_group_id} с {len(media_group['media'])} элементами")
     
     # Создаем галерею из изображений и видео
     gallery_html = '<div class="wp-block-gallery"><ul class="blocks-gallery-grid">'
@@ -206,7 +215,7 @@ async def process_media_group(context: CallbackContext):
         <br><br>
         <a href="https://t.me/{2}/{3}" class="telegram-link">Перейти в Telegram</a>
     </div>
-    """.format(gallery_html, media_group['text'].replace('\n', '<br>'), 
+    """.format(gallery_html, media_group['text'].replace('\n', '<br>') if media_group['text'] else "", 
                media_group['channel_username'], media_group['message_id'])
     
     # Публикация в WordPress с первым изображением как миниатюрой (если есть)
@@ -216,20 +225,38 @@ async def process_media_group(context: CallbackContext):
     # Отправка сообщения администратору о результате
     if success:
         await send_admin_message(
-            context.bot,
+            bot,
             f"✅ Новый пост с медиа-группой успешно опубликован на сайте!\nЗаголовок: {media_group['title']}\nСсылка: {post_url}"
         )
     else:
         await send_admin_message(
-            context.bot,
+            bot,
             f"❌ Не удалось опубликовать пост с медиа-группой на сайт.\nЗаголовок: {media_group['title']}"
         )
     
-    # Удаляем обработанную медиа-группу
-    del context.bot_data['media_groups'][media_group_id]
+    # Удаляем обработанную медиа-группу и её таймер
+    if media_group_id in media_groups:
+        del media_groups[media_group_id]
+    
+    if media_group_id in media_group_timers:
+        del media_group_timers[media_group_id]
+
+# Функция таймера для отложенной обработки медиа-группы
+def delayed_media_group_processing(bot, media_group_id):
+    """Функция для запуска асинхронного процесса обработки медиа-группы через Threading"""
+    async def _process():
+        await process_media_group(bot, media_group_id)
+    
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_process())
+    loop.close()
 
 # Обработчик новых сообщений в канале
 async def channel_post(update: Update, context: CallbackContext):
+    global media_groups, media_group_timers
+    
     message = update.channel_post
     
     # Проверяем, что сообщение пришло из нужного канала
@@ -238,28 +265,26 @@ async def channel_post(update: Update, context: CallbackContext):
     
     logger.info(f"Получено новое сообщение из канала: {message.chat.title}")
     
-    # Проверка наличия текста
-    if not message.text and not message.caption:
-        logger.info("Сообщение без текста, пропускаем.")
-        return
-    
     # Получение текста сообщения (либо из text, либо из caption)
-    text = message.text if message.text else message.caption
+    text = ""
+    if message.text:
+        text = message.text
+    elif message.caption:
+        text = message.caption
     
     # Создание заголовка (первая строка или первые 100 символов)
-    title = text.split('\n')[0][:100]
+    title = text.split('\n')[0][:100] if text else "Новый пост"
     
     # Получение канала для ссылки
     channel_username = message.chat.username or "channel"  # Если канал без username
     
     # Проверка на наличие медиа-группы
-    if hasattr(message, 'media_group_id') and message.media_group_id:
-        # Для медиа-группы нужно сохранить ID группы и обработать все сообщения группы
-        if not hasattr(context.bot_data, 'media_groups'):
-            context.bot_data['media_groups'] = {}
+    if message.media_group_id:
+        logger.info(f"Обнаружено сообщение из медиа-группы: {message.media_group_id}")
         
-        if message.media_group_id not in context.bot_data['media_groups']:
-            context.bot_data['media_groups'][message.media_group_id] = {
+        # Если это первое сообщение группы, создаем запись
+        if message.media_group_id not in media_groups:
+            media_groups[message.media_group_id] = {
                 'media': [],
                 'text': text,
                 'title': title,
@@ -267,31 +292,52 @@ async def channel_post(update: Update, context: CallbackContext):
                 'channel_username': channel_username,
                 'timestamp': time.time()
             }
+        else:
+            # Обновляем timestamp (время последнего обновления группы)
+            media_groups[message.media_group_id]['timestamp'] = time.time()
+            
+            # Если текст отсутствует в первом сообщении, но есть в текущем
+            if not media_groups[message.media_group_id]['text'] and text:
+                media_groups[message.media_group_id]['text'] = text
+                media_groups[message.media_group_id]['title'] = title
         
         # Добавляем медиа в группу
         if message.photo:
             photo = message.photo[-1]
             file = await context.bot.get_file(photo.file_id)
-            context.bot_data['media_groups'][message.media_group_id]['media'].append({
+            media_groups[message.media_group_id]['media'].append({
                 'type': 'photo',
                 'url': file.file_path
             })
+            logger.info(f"Добавлено фото в медиа-группу {message.media_group_id}")
         elif message.video:
             file = await context.bot.get_file(message.video.file_id)
-            context.bot_data['media_groups'][message.media_group_id]['media'].append({
+            media_groups[message.media_group_id]['media'].append({
                 'type': 'video',
                 'url': file.file_path
             })
+            logger.info(f"Добавлено видео в медиа-группу {message.media_group_id}")
         
-        # Установим таймер на обработку группы через 2 секунды
-        # (чтобы дождаться всех сообщений группы)
-        context.job_queue.run_once(
-            process_media_group, 
-            2, 
-            data=message.media_group_id
+        # Отменяем предыдущий таймер для этой группы, если он существует
+        if message.media_group_id in media_group_timers:
+            timer = media_group_timers[message.media_group_id]
+            timer.cancel()
+        
+        # Создаем новый таймер для отложенной обработки группы
+        timer = threading.Timer(
+            5.0,  # Ждем 5 секунд после последнего сообщения
+            delayed_media_group_processing,
+            args=[context.bot, message.media_group_id]
         )
+        timer.daemon = True  # Чтобы таймер не блокировал завершение программы
+        timer.start()
+        
+        # Сохраняем таймер
+        media_group_timers[message.media_group_id] = timer
+        
         return
     
+    # Если сообщение не является частью медиа-группы, обрабатываем его сразу
     # Создание контента с текстом и ссылкой на Telegram
     html_content = """
     <div class="telegram-post">
@@ -299,7 +345,7 @@ async def channel_post(update: Update, context: CallbackContext):
         <br><br>
         <a href="https://t.me/{1}/{2}" class="telegram-link">Перейти в Telegram</a>
     </div>
-    """.format(text.replace('\n', '<br>'), channel_username, message.message_id)
+    """.format(text.replace('\n', '<br>') if text else "", channel_username, message.message_id)
     
     # Обработка различных типов медиа
     featured_media_id = None
